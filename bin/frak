@@ -28,6 +28,9 @@
 #:   rsync_path    override the rsync-path read from .frak file (if present)
 #:   ignore        ignore certain files or folders when deploying
 #:   webhook_url   URL for a webhook which will receive information about the code pushed via frak
+#:   openai_api_key OpenAI API key for generating diff summaries
+#:   openai_model  OpenAI preferred model for generating diff summaries. Defaults to "gpt-4o"
+#:   openai_prompt Custom OpenAI prompt for generating diff summaries
 #:   --no-color    Disable ANSI colors in diff output.
 #:
 #: Examples
@@ -573,6 +576,9 @@ method: rsync
   end
 end
 
+##
+# Check for updates
+
 def auto_update
   require 'open-uri'
 
@@ -642,12 +648,17 @@ def auto_update
 end
 
 ##
-# Post to a configured webhook
+# Post a message to a webhook
 
 def post_webhook
   require 'net/http'
+  require 'json'
 
   begin
+    # Ensure diff_contents is a string and limit to 10k characters
+    diff_text = $diff_contents.to_s
+    truncated_diff = diff_text.length > 400000 ? diff_text[0...400000] + "\n... (truncated)" : diff_text
+
     # Post a message to the webhook containing information on the push
     url = URI.parse($options[:webhook_url])
     params = {
@@ -658,7 +669,47 @@ def post_webhook
         'diff_file' => $diff_name,
         'diff_contents' => $diff_contents,
         'files_changed' => $file_changes,
-      }
+    }
+
+    # If OpenAI API key is configured, get a summary of the diff
+    if $options[:openai_api_key]
+      begin
+        openai_url = URI.parse('https://api.openai.com/v1/chat/completions')
+        openai_request = Net::HTTP::Post.new(openai_url)
+        openai_request['Authorization'] = "Bearer #{$options[:openai_api_key]}"
+        openai_request['Content-Type'] = 'application/json'
+
+        default_prompt = "Summarize the following Git diff by explaining in a non-technical way how the changes will affect the repo's behavior. Git Diff Content:"
+
+        prompt = $options[:openai_prompt] ? $options[:openai_prompt] : default_prompt
+        model = $options[:openai_model] ? $options[:openai_model] : 'gpt-4o'
+
+        openai_request.body = {
+          model: model,
+          messages: [
+            {
+              role: 'user',
+              content: "#{prompt}\n#{truncated_diff}"
+            }
+          ]
+        }.to_json
+
+        openai_response = Net::HTTP.start(openai_url.hostname, openai_url.port, :use_ssl => true) do |http|
+          http.request(openai_request)
+        end
+
+        if openai_response.code.match(/2../)
+          summary = JSON.parse(openai_response.body)['choices'][0]['message']['content']
+          params['summary'] = summary
+          debug "Generated summary: #{summary}"
+        else
+          debug "Failed to generate summary: #{openai_response.body}", ANSI::YELLOW
+        end
+      rescue Exception => e
+        debug "Failed to generate summary: #{e.message}", ANSI::YELLOW
+      end
+    end
+
     request = Net::HTTP::Post.new(url.request_uri)
     request.form_data = params
     response = Net::HTTP.start(url.hostname, url.port, :use_ssl => url.scheme == 'https' ) do |http|
